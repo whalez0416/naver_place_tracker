@@ -9,11 +9,8 @@ import time
 import random
 import logging
 import re
-from datetime import datetime
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -22,24 +19,28 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
 )
-from webdriver_manager.chrome import ChromeDriverManager
-import gspread
 
 from config import (
-    CREDENTIALS_JSON_PATH,
-    SPREADSHEET_ID,
-    WORKSHEET_NAME,
     TARGET_PLACE_NAME,
     TARGET_PLACE_ID,
     KEYWORDS,
     KEYWORDS_GOOGLE_ONLY,
-    USER_AGENTS,
     SLEEP_RANGE,
     PAGE_LOAD_TIMEOUT,
-    HEADLESS_MODE,
     LOG_FILE,
     LOG_LEVEL,
+    NOTIFY_ON_BLOCK,
+    NOTIFY_SUMMARY_EACH_RUN,
 )
+from anti_block import (
+    create_driver,
+    is_blocked,
+    naver_cooldown_remaining,
+    set_naver_cooldown,
+    clear_naver_cooldown,
+)
+from sheet_io import write_to_sheet
+import notifier
 
 # ── 로깅 설정 ──────────────────────────────────────────────
 logging.basicConfig(
@@ -55,54 +56,6 @@ logger = logging.getLogger(__name__)
 # URL 템플릿
 PCMAP_URL = "https://pcmap.place.naver.com/restaurant/list?query={keyword}"
 GOOGLE_LOCAL_URL = "https://www.google.com/search?q={keyword}&udm=1"
-
-# 차단/접근제한 페이지를 식별하는 문구 (네이버·구글 공통)
-BLOCK_SIGNATURES = [
-    "서비스 이용이 제한",
-    "과도한 접근",
-    "비정상적인 트래픽",
-    "unusual traffic",
-    "automated queries",
-    "캡차",
-    "captcha",
-]
-
-
-# ── 차단 페이지 감지 ───────────────────────────────────────
-def is_blocked(driver: webdriver.Chrome) -> bool:
-    """현재 페이지가 IP 차단/접근제한/캡차 페이지인지 판별합니다."""
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-    except Exception:
-        return False
-    return any(sig.lower() in body_text for sig in BLOCK_SIGNATURES)
-
-
-# ── Selenium 드라이버 생성 ─────────────────────────────────
-def create_driver() -> webdriver.Chrome:
-    """Chrome WebDriver를 생성하고 반환합니다."""
-    user_agent = random.choice(USER_AGENTS)
-    opts = Options()
-    if HEADLESS_MODE:
-        opts.add_argument("--headless=new")
-    opts.add_argument(f"--user-agent={user_agent}")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--lang=ko-KR")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
-    )
-    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT * 3)
-    logger.info(f"Chrome 드라이버 생성 완료 (UA: {user_agent[:50]}...)")
-    return driver
 
 
 # ── 네이버: 스크롤하여 모든 항목 로딩 ─────────────────────
@@ -429,57 +382,6 @@ def get_google_rank(driver: webdriver.Chrome, keyword: str) -> dict:
     return result
 
 
-# ── 구글 스프레드시트 기록 ──────────────────────────────────
-def write_to_sheet(results: list[dict]):
-    """검색 결과를 구글 스프레드시트에 기록합니다."""
-    try:
-        gc = gspread.service_account(filename=CREDENTIALS_JSON_PATH)
-        sh = gc.open_by_key(SPREADSHEET_ID)
-
-        try:
-            worksheet = sh.worksheet(WORKSHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            worksheet = sh.sheet1
-            logger.warning(f"'{WORKSHEET_NAME}' 시트 없음 — 첫 번째 시트 사용")
-
-        existing = worksheet.get_all_values()
-        headers = ["날짜", "시간", "매체", "키워드", "순위(광고제외)", "순위(전체)", "광고여부", "업체명", "평점", "리뷰수", "검색결과수"]
-        
-        if not existing:
-            worksheet.append_row(headers, value_input_option="RAW")
-        elif len(existing[0]) < len(headers):
-            # 기존 헤더가 옛날 버전인 경우 업데이트
-            worksheet.update('A1:K1', [headers])
-
-        now = datetime.now()
-        date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H:%M:%S")
-
-        rows = []
-        for r in results:
-            rank_str = str(r["rank"]) if r["rank"] is not None else "순위권 밖"
-            rank_total_str = str(r["rank_total"]) if r["rank_total"] is not None else "순위권 밖"
-            ad_str = "O" if r["is_ad"] else "X"
-            found = r["found_name"] or TARGET_PLACE_NAME
-            rating = str(r.get("rating") or "")
-            review_count = str(r.get("review_count") or "")
-            
-            rows.append([
-                date_str, time_str, r["platform"], r["keyword"],
-                rank_str, rank_total_str, ad_str, found, rating, review_count, r["total_count"],
-            ])
-
-        worksheet.append_rows(rows, value_input_option="RAW")
-        logger.info(f"구글 시트에 {len(rows)}건 기록 완료")
-
-    except FileNotFoundError:
-        logger.error(f"credentials 파일을 찾을 수 없습니다: {CREDENTIALS_JSON_PATH}")
-    except gspread.exceptions.SpreadsheetNotFound:
-        logger.error(f"스프레드시트를 찾을 수 없습니다 (ID: {SPREADSHEET_ID})")
-    except Exception as e:
-        logger.error(f"구글 시트 기록 중 오류: {e}", exc_info=True)
-
-
 # ── 메인 실행 ──────────────────────────────────────────────
 def main():
     logger.info("=" * 60)
@@ -490,7 +392,17 @@ def main():
 
     driver = None
     results = []
-    naver_blocked = False  # 네이버 차단 감지 시 남은 네이버 조회를 건너뜀
+
+    # 직전 실행에서 네이버가 차단됐다면 쿨다운 동안 네이버를 건너뜀
+    cooldown = naver_cooldown_remaining()
+    naver_blocked = cooldown is not None
+    if naver_blocked:
+        hrs = cooldown.total_seconds() / 3600
+        logger.warning(
+            f"⏳ 네이버 쿨다운 중 (약 {hrs:.1f}시간 남음) — 이번 실행은 구글만 조회합니다."
+        )
+
+    block_notified = False  # 이번 실행에서 차단 알림을 이미 보냈는지
 
     try:
         driver = create_driver()
@@ -500,17 +412,23 @@ def main():
             if not naver_blocked:
                 naver_result = get_naver_rank(driver, keyword)
                 if naver_result.get("blocked"):
-                    # 한 번 차단되면 계속 두드릴수록 차단이 길어지므로 즉시 중단
+                    # 한 번 차단되면 계속 두드릴수록 차단이 길어지므로 즉시 중단 + 쿨다운 기록
                     naver_blocked = True
+                    set_naver_cooldown()
                     logger.warning(
                         "⚠️  네이버 차단 감지 — 남은 네이버 키워드 조회를 모두 건너뜁니다. "
                         "(구글 조회는 계속 진행)"
                     )
+                    if NOTIFY_ON_BLOCK and not block_notified:
+                        notifier.notify_block("네이버")
+                        block_notified = True
                 else:
                     results.append(naver_result)
+                    # 정상 조회 성공 시 (순위 발견 여부와 무관하게) 쿨다운 해제
+                    clear_naver_cooldown()
                     time.sleep(random.uniform(*SLEEP_RANGE))
             else:
-                logger.info(f"[네이버] '{keyword}' — 차단 상태로 건너뜀")
+                logger.info(f"[네이버] '{keyword}' — 차단/쿨다운 상태로 건너뜀")
 
             google_result = get_google_rank(driver, keyword)
             if not google_result.get("blocked"):
@@ -536,23 +454,44 @@ def main():
         logger.error(f"크롤링 중 치명적 오류: {e}", exc_info=True)
     finally:
         if driver:
-            driver.quit()
-            logger.info("Chrome 드라이버 종료")
+            try:
+                driver.quit()
+                logger.info("Chrome 드라이버 종료")
+            except Exception:
+                pass
 
+    changes = []
     if results:
-        write_to_sheet(results)
+        changes = write_to_sheet(results)
 
     # 결과 요약
     logger.info("")
     logger.info("=" * 60)
     logger.info("📊 결과 요약")
     logger.info("-" * 60)
+    summary_lines = []
     for r in results:
         rank = r["rank"] if r["rank"] is not None else "순위권 밖"
         rank_t = r["rank_total"] if r["rank_total"] is not None else "-"
         ad = " [광고]" if r["is_ad"] else ""
-        logger.info(f"  [{r['platform']}] {r['keyword']:<12s} → 광고제외 {rank}위 / 전체 {rank_t}위{ad}")
+        delta = r.get("delta")
+        if delta:
+            delta_mark = f" ({'▲' if delta > 0 else '▼'}{abs(delta)})"
+        else:
+            delta_mark = ""
+        logger.info(
+            f"  [{r['platform']}] {r['keyword']:<12s} → 광고제외 {rank}위 / 전체 {rank_t}위{ad}{delta_mark}"
+        )
+        summary_lines.append(
+            f"[{r['platform']}] {r['keyword']}: {rank}위{delta_mark}"
+        )
     logger.info("=" * 60)
+
+    # 알림: 순위 급변 / 요약
+    if changes:
+        notifier.notify_rank_changes(changes)
+    if NOTIFY_SUMMARY_EACH_RUN:
+        notifier.notify_summary(summary_lines)
 
 
 if __name__ == "__main__":

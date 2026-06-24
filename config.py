@@ -5,6 +5,15 @@
 # 아래 값을 본인의 환경에 맞게 수정하세요.
 # ============================================================
 
+import os
+
+# .env 파일이 있으면 환경변수로 로드 (없어도 무시)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # --- Google Sheets 설정 ---
 # Google Cloud 서비스 계정 credentials JSON 파일 경로
 CREDENTIALS_JSON_PATH = "naver-place-tracker-2b48f6ba8e6d.json"
@@ -82,3 +91,49 @@ LOG_FILE = "rank_tracker.log"
 
 # 로그 레벨 ("DEBUG", "INFO", "WARNING", "ERROR")
 LOG_LEVEL = "INFO"
+
+
+# ============================================================
+# 고급 설정 (차단 회피 / 백업 / 알림)
+# ============================================================
+
+# --- 차단 회피 / 쿨다운 ---
+# undetected-chromedriver 사용 여부 (탐지 회피 강화, 별도 설치 필요)
+#   pip install undetected-chromedriver
+#   설치돼 있지 않거나 False면 일반 Selenium으로 자동 동작합니다.
+USE_UNDETECTED_CHROMEDRIVER = False
+
+# 네이버 차단을 감지하면 이 시간(시간 단위)만큼 네이버 조회를 자동으로 건너뜁니다.
+# 차단 상태를 STATE_FILE에 기록해 다음 실행에서도 쿨다운이 유지됩니다.
+NAVER_COOLDOWN_HOURS = 6
+
+# 차단/쿨다운 상태를 저장하는 파일
+STATE_FILE = "state.json"
+
+# 일시적 오류(타임아웃/네트워크) 시 재시도 횟수와 재시도 전 대기(초) 범위
+MAX_RETRIES = 2
+RETRY_BACKOFF = (6, 14)
+
+
+# --- 로컬 CSV 백업 ---
+# 구글시트 기록과 별개로 모든 결과를 로컬 CSV에도 누적 저장합니다.
+# (시트 기록이 실패해도 데이터가 보존됩니다.)
+CSV_BACKUP_PATH = "rank_history.csv"
+
+
+# --- 알림 (텔레그램) ---
+# BotFather로 봇 생성 → 토큰 확인, @userinfobot 에게 말 걸어 chat_id 확인.
+# 보안을 위해 값은 .env 파일이나 환경변수로 넣는 것을 권장합니다.
+#   TELEGRAM_BOT_TOKEN=123456:ABC...
+#   TELEGRAM_CHAT_ID=123456789
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# 순위가 이 값 이상 변동(상승/하락)하면 알림을 보냅니다.
+NOTIFY_RANK_CHANGE_THRESHOLD = 5
+
+# IP 차단 감지 시 알림 전송 여부
+NOTIFY_ON_BLOCK = True
+
+# 매 실행 종료 시 요약 알림 전송 여부 (변동 없어도 매번 보냄)
+NOTIFY_SUMMARY_EACH_RUN = False

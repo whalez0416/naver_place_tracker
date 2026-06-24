@@ -1,0 +1,7 @@
+# 선택 설치 패키지
+# 차단(탐지) 회피를 더 강화하고 싶을 때만 설치하세요.
+#   pip install -r requirements-optional.txt
+# 설치 후 config.py 에서 USE_UNDETECTED_CHROMEDRIVER = True 로 변경하면 적용됩니다.
+# 미설치/False 인 경우 일반 Selenium 으로 자동 동작합니다.
+
+undetected-chromedriver>=3.5.5

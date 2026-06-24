@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 .env
 venv/
+
+# 런타임 생성 파일
+rank_history.csv
+state.json
