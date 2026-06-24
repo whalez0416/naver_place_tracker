@@ -31,6 +31,8 @@ from config import (
     LOG_LEVEL,
     NOTIFY_ON_BLOCK,
     NOTIFY_SUMMARY_EACH_RUN,
+    MAX_RETRIES,
+    RETRY_BACKOFF,
 )
 from anti_block import (
     create_driver,
@@ -271,28 +273,51 @@ def get_google_rank(driver: webdriver.Chrome, keyword: str) -> dict:
     }
 
     try:
-        driver.get(url)
-        time.sleep(3)
+        # 구글의 접근제한/캡차는 보통 '버스트' 때문에 생기는 일시 제한이라
+        # 백오프 후 재시도하면 대개 정상 결과를 얻을 수 있습니다.
+        # (네이버처럼 하드 IP 차단이 아니므로 즉시 버리지 않고 MAX_RETRIES 만큼 재시도)
+        loaded = False
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                driver.get(url)
+            except WebDriverException as e:
+                logger.warning(f"[구글] '{keyword}' 페이지 로드 오류: {e}")
+            time.sleep(3)
 
-        # 접근제한/캡차 페이지인지 먼저 확인
-        if is_blocked(driver):
-            logger.error(f"🚫 [구글] '{keyword}' — 접근제한/캡차 감지됨.")
-            result["blocked"] = True
-            return result
+            blocked_now = is_blocked(driver)
+            if not blocked_now:
+                # 로컬 결과 로딩 대기
+                try:
+                    WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, ".VkpGBb, .cXedhc, div[data-cid]")
+                        )
+                    )
+                    loaded = True
+                    break
+                except TimeoutException:
+                    blocked_now = is_blocked(driver)
+                    if not blocked_now:
+                        # 차단이 아닌 순수 타임아웃은 재시도 의미가 적음 → 종료
+                        logger.warning(f"[구글] '{keyword}' — 로딩 타임아웃")
+                        return result
 
-        # 로컬 결과 로딩 대기
-        try:
-            WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, ".VkpGBb, .cXedhc, div[data-cid]")
+            # 여기 도달 = 차단/제한 감지됨
+            if attempt < MAX_RETRIES:
+                wait = random.uniform(*RETRY_BACKOFF)
+                logger.warning(
+                    f"🚫 [구글] '{keyword}' 일시 제한 감지 — {wait:.1f}초 후 재시도 "
+                    f"({attempt + 1}/{MAX_RETRIES})"
                 )
-            )
-        except TimeoutException:
-            if is_blocked(driver):
-                logger.error(f"🚫 [구글] '{keyword}' — 접근제한/캡차 감지됨.")
-                result["blocked"] = True
+                time.sleep(wait)
             else:
-                logger.warning(f"[구글] '{keyword}' — 로딩 타임아웃")
+                logger.error(
+                    f"🚫 [구글] '{keyword}' — 접근제한/캡차 (재시도 {MAX_RETRIES}회 모두 실패)"
+                )
+                result["blocked"] = True
+                return result
+
+        if not loaded:
             return result
 
         # 페이지네이션으로 전체 결과 탐색 (최대 5페이지 = 100개)
