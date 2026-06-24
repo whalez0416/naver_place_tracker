@@ -19,14 +19,15 @@ def job():
         logger.error(f"실행 중 오류 발생: {e}")
 
 if __name__ == "__main__":
-    logger.info("3시간 간격 스케줄러를 시작합니다. (이 창을 닫으면 스케줄러가 종료됩니다)")
-    
+    logger.info("12시간 간격 스케줄러를 시작합니다. (이 창을 닫으면 스케줄러가 종료됩니다)")
+
     # 처음 시작할 때 한 번 실행 (원치 않으면 아래 줄 주석 처리)
     job()
-    
-    # 3시간마다 job 함수 실행
-    schedule.every(3).hours.do(job)
-    
+
+    # 12시간마다 job 함수 실행 (하루 2회)
+    # 너무 자주 실행하면 네이버에서 "과도한 접근"으로 IP가 차단됩니다.
+    schedule.every(12).hours.do(job)
+
     while True:
         schedule.run_pending()
         time.sleep(60) # 1분마다 스케줄 확인

@@ -56,6 +56,27 @@ logger = logging.getLogger(__name__)
 PCMAP_URL = "https://pcmap.place.naver.com/restaurant/list?query={keyword}"
 GOOGLE_LOCAL_URL = "https://www.google.com/search?q={keyword}&udm=1"
 
+# 차단/접근제한 페이지를 식별하는 문구 (네이버·구글 공통)
+BLOCK_SIGNATURES = [
+    "서비스 이용이 제한",
+    "과도한 접근",
+    "비정상적인 트래픽",
+    "unusual traffic",
+    "automated queries",
+    "캡차",
+    "captcha",
+]
+
+
+# ── 차단 페이지 감지 ───────────────────────────────────────
+def is_blocked(driver: webdriver.Chrome) -> bool:
+    """현재 페이지가 IP 차단/접근제한/캡차 페이지인지 판별합니다."""
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    except Exception:
+        return False
+    return any(sig.lower() in body_text for sig in BLOCK_SIGNATURES)
+
 
 # ── Selenium 드라이버 생성 ─────────────────────────────────
 def create_driver() -> webdriver.Chrome:
@@ -146,11 +167,21 @@ def get_naver_rank(driver: webdriver.Chrome, keyword: str) -> dict:
         "found_name": None,
         "rating": None,
         "review_count": None,
+        "blocked": False,
     }
 
     try:
         driver.get(url)
         time.sleep(3)
+
+        # 접근제한/차단 페이지인지 먼저 확인
+        if is_blocked(driver):
+            logger.error(
+                f"🚫 [네이버] '{keyword}' — IP 차단/접근제한 감지됨. "
+                f"이번 실행의 네이버 조회를 중단합니다."
+            )
+            result["blocked"] = True
+            return result
 
         try:
             WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
@@ -159,7 +190,15 @@ def get_naver_rank(driver: webdriver.Chrome, keyword: str) -> dict:
                 )
             )
         except TimeoutException:
-            logger.warning(f"[네이버] '{keyword}' — 로딩 타임아웃")
+            # 타임아웃 시점에 차단 페이지로 바뀌었을 수 있으므로 재확인
+            if is_blocked(driver):
+                logger.error(
+                    f"🚫 [네이버] '{keyword}' — IP 차단/접근제한 감지됨. "
+                    f"이번 실행의 네이버 조회를 중단합니다."
+                )
+                result["blocked"] = True
+            else:
+                logger.warning(f"[네이버] '{keyword}' — 로딩 타임아웃")
             return result
 
         total_loaded = scroll_to_load_all(driver)
@@ -275,11 +314,18 @@ def get_google_rank(driver: webdriver.Chrome, keyword: str) -> dict:
         "found_name": None,
         "rating": None,
         "review_count": None,
+        "blocked": False,
     }
 
     try:
         driver.get(url)
         time.sleep(3)
+
+        # 접근제한/캡차 페이지인지 먼저 확인
+        if is_blocked(driver):
+            logger.error(f"🚫 [구글] '{keyword}' — 접근제한/캡차 감지됨.")
+            result["blocked"] = True
+            return result
 
         # 로컬 결과 로딩 대기
         try:
@@ -289,7 +335,11 @@ def get_google_rank(driver: webdriver.Chrome, keyword: str) -> dict:
                 )
             )
         except TimeoutException:
-            logger.warning(f"[구글] '{keyword}' — 로딩 타임아웃")
+            if is_blocked(driver):
+                logger.error(f"🚫 [구글] '{keyword}' — 접근제한/캡차 감지됨.")
+                result["blocked"] = True
+            else:
+                logger.warning(f"[구글] '{keyword}' — 로딩 타임아웃")
             return result
 
         # 페이지네이션으로 전체 결과 탐색 (최대 5페이지 = 100개)
@@ -440,19 +490,31 @@ def main():
 
     driver = None
     results = []
+    naver_blocked = False  # 네이버 차단 감지 시 남은 네이버 조회를 건너뜀
 
     try:
         driver = create_driver()
 
         # 한국어 키워드: 네이버 + 구글 모두 추적
         for i, keyword in enumerate(KEYWORDS):
-            naver_result = get_naver_rank(driver, keyword)
-            results.append(naver_result)
-
-            time.sleep(random.uniform(*SLEEP_RANGE))
+            if not naver_blocked:
+                naver_result = get_naver_rank(driver, keyword)
+                if naver_result.get("blocked"):
+                    # 한 번 차단되면 계속 두드릴수록 차단이 길어지므로 즉시 중단
+                    naver_blocked = True
+                    logger.warning(
+                        "⚠️  네이버 차단 감지 — 남은 네이버 키워드 조회를 모두 건너뜁니다. "
+                        "(구글 조회는 계속 진행)"
+                    )
+                else:
+                    results.append(naver_result)
+                    time.sleep(random.uniform(*SLEEP_RANGE))
+            else:
+                logger.info(f"[네이버] '{keyword}' — 차단 상태로 건너뜀")
 
             google_result = get_google_rank(driver, keyword)
-            results.append(google_result)
+            if not google_result.get("blocked"):
+                results.append(google_result)
 
             wait = random.uniform(*SLEEP_RANGE)
             logger.info(f"다음 키워드까지 {wait:.1f}초 대기...")
@@ -462,7 +524,8 @@ def main():
         logger.info("--- 구글 전용 키워드 (외국인 관광객) ---")
         for i, keyword in enumerate(KEYWORDS_GOOGLE_ONLY):
             google_result = get_google_rank(driver, keyword)
-            results.append(google_result)
+            if not google_result.get("blocked"):
+                results.append(google_result)
 
             if i < len(KEYWORDS_GOOGLE_ONLY) - 1:
                 wait = random.uniform(*SLEEP_RANGE)
