@@ -33,13 +33,16 @@ from config import (
     NOTIFY_SUMMARY_EACH_RUN,
     MAX_RETRIES,
     RETRY_BACKOFF,
+    NAVER_COOLDOWN_HOURS,
+    GOOGLE_COOLDOWN_HOURS,
+    GOOGLE_BLOCK_STREAK_LIMIT,
 )
 from anti_block import (
     create_driver,
     is_blocked,
-    naver_cooldown_remaining,
-    set_naver_cooldown,
-    clear_naver_cooldown,
+    cooldown_remaining,
+    set_cooldown,
+    clear_cooldown,
 )
 from sheet_io import write_to_sheet
 import notifier
@@ -304,7 +307,8 @@ def get_google_rank(driver: webdriver.Chrome, keyword: str) -> dict:
 
             # 여기 도달 = 차단/제한 감지됨
             if attempt < MAX_RETRIES:
-                wait = random.uniform(*RETRY_BACKOFF)
+                # 지수 백오프: 시도할수록 대기를 2배씩 늘림
+                wait = random.uniform(*RETRY_BACKOFF) * (2 ** attempt)
                 logger.warning(
                     f"🚫 [구글] '{keyword}' 일시 제한 감지 — {wait:.1f}초 후 재시도 "
                     f"({attempt + 1}/{MAX_RETRIES})"
@@ -418,59 +422,97 @@ def main():
     driver = None
     results = []
 
-    # 직전 실행에서 네이버가 차단됐다면 쿨다운 동안 네이버를 건너뜀
-    cooldown = naver_cooldown_remaining()
-    naver_blocked = cooldown is not None
+    # 직전 실행에서 차단됐다면 쿨다운 동안 해당 플랫폼을 건너뜀
+    naver_cd = cooldown_remaining("naver")
+    naver_blocked = naver_cd is not None
     if naver_blocked:
-        hrs = cooldown.total_seconds() / 3600
         logger.warning(
-            f"⏳ 네이버 쿨다운 중 (약 {hrs:.1f}시간 남음) — 이번 실행은 구글만 조회합니다."
+            f"⏳ 네이버 쿨다운 중 (약 {naver_cd.total_seconds() / 3600:.1f}시간 남음) — "
+            f"이번 실행은 네이버 조회를 건너뜁니다."
         )
 
-    block_notified = False  # 이번 실행에서 차단 알림을 이미 보냈는지
+    google_cd = cooldown_remaining("google")
+    google_blocked = google_cd is not None
+    if google_blocked:
+        logger.warning(
+            f"⏳ 구글 쿨다운 중 (약 {google_cd.total_seconds() / 3600:.1f}시간 남음) — "
+            f"이번 실행은 구글 조회를 건너뜁니다."
+        )
+
+    # 이번 실행에서 플랫폼별 차단 알림을 이미 보냈는지
+    block_notified = set()
+    # 구글 연속 차단 횟수 (연속으로 GOOGLE_BLOCK_STREAK_LIMIT회면 남은 구글 조회 중단)
+    google_streak = 0
+
+    def query_google(keyword):
+        """구글 조회 + 연속 차단 회로 차단기. 실제로 요청을 보냈으면 True, 스킵했으면 False."""
+        nonlocal google_blocked, google_streak
+        if google_blocked:
+            logger.info(f"[구글] '{keyword}' — 차단/쿨다운 상태로 건너뜀")
+            return False
+        google_result = get_google_rank(driver, keyword)
+        if google_result.get("blocked"):
+            google_streak += 1
+            if NOTIFY_ON_BLOCK and "구글" not in block_notified:
+                notifier.notify_block("구글")
+                block_notified.add("구글")
+            if google_streak >= GOOGLE_BLOCK_STREAK_LIMIT:
+                # 계속 두드릴수록 제한이 길어지므로 남은 구글 조회를 중단하고 쿨다운
+                google_blocked = True
+                set_cooldown("google", GOOGLE_COOLDOWN_HOURS)
+                logger.warning(
+                    f"⚠️  구글 연속 {google_streak}회 차단 — "
+                    f"남은 구글 키워드 조회를 모두 건너뜁니다."
+                )
+        else:
+            google_streak = 0
+            results.append(google_result)
+            # 정상 조회 성공 시 쿨다운/연속차단 카운트 해제
+            clear_cooldown("google")
+        return True
 
     try:
         driver = create_driver()
 
         # 한국어 키워드: 네이버 + 구글 모두 추적
-        for i, keyword in enumerate(KEYWORDS):
+        for keyword in KEYWORDS:
+            naver_queried = False
             if not naver_blocked:
+                naver_queried = True
                 naver_result = get_naver_rank(driver, keyword)
                 if naver_result.get("blocked"):
                     # 한 번 차단되면 계속 두드릴수록 차단이 길어지므로 즉시 중단 + 쿨다운 기록
                     naver_blocked = True
-                    set_naver_cooldown()
+                    set_cooldown("naver", NAVER_COOLDOWN_HOURS)
                     logger.warning(
                         "⚠️  네이버 차단 감지 — 남은 네이버 키워드 조회를 모두 건너뜁니다. "
                         "(구글 조회는 계속 진행)"
                     )
-                    if NOTIFY_ON_BLOCK and not block_notified:
+                    if NOTIFY_ON_BLOCK and "네이버" not in block_notified:
                         notifier.notify_block("네이버")
-                        block_notified = True
+                        block_notified.add("네이버")
                 else:
                     results.append(naver_result)
                     # 정상 조회 성공 시 (순위 발견 여부와 무관하게) 쿨다운 해제
-                    clear_naver_cooldown()
+                    clear_cooldown("naver")
                     time.sleep(random.uniform(*SLEEP_RANGE))
             else:
                 logger.info(f"[네이버] '{keyword}' — 차단/쿨다운 상태로 건너뜀")
 
-            google_result = get_google_rank(driver, keyword)
-            if not google_result.get("blocked"):
-                results.append(google_result)
+            google_queried = query_google(keyword)
 
-            wait = random.uniform(*SLEEP_RANGE)
-            logger.info(f"다음 키워드까지 {wait:.1f}초 대기...")
-            time.sleep(wait)
+            # 실제 요청을 하나도 안 보낸(모두 스킵) 경우엔 대기하지 않고 바로 진행
+            if naver_queried or google_queried:
+                wait = random.uniform(*SLEEP_RANGE)
+                logger.info(f"다음 키워드까지 {wait:.1f}초 대기...")
+                time.sleep(wait)
 
         # 영어 키워드: 구글만 추적 (외국인 관광객용)
         logger.info("--- 구글 전용 키워드 (외국인 관광객) ---")
         for i, keyword in enumerate(KEYWORDS_GOOGLE_ONLY):
-            google_result = get_google_rank(driver, keyword)
-            if not google_result.get("blocked"):
-                results.append(google_result)
+            google_queried = query_google(keyword)
 
-            if i < len(KEYWORDS_GOOGLE_ONLY) - 1:
+            if google_queried and i < len(KEYWORDS_GOOGLE_ONLY) - 1:
                 wait = random.uniform(*SLEEP_RANGE)
                 logger.info(f"다음 키워드까지 {wait:.1f}초 대기...")
                 time.sleep(wait)
@@ -496,8 +538,8 @@ def main():
     logger.info("-" * 60)
     summary_lines = []
     for r in results:
-        rank = r["rank"] if r["rank"] is not None else "순위권 밖"
-        rank_t = r["rank_total"] if r["rank_total"] is not None else "-"
+        rank = f"{r['rank']}위" if r["rank"] is not None else "순위권 밖"
+        rank_t = f"{r['rank_total']}위" if r["rank_total"] is not None else "-"
         ad = " [광고]" if r["is_ad"] else ""
         delta = r.get("delta")
         if delta:
@@ -505,10 +547,10 @@ def main():
         else:
             delta_mark = ""
         logger.info(
-            f"  [{r['platform']}] {r['keyword']:<12s} → 광고제외 {rank}위 / 전체 {rank_t}위{ad}{delta_mark}"
+            f"  [{r['platform']}] {r['keyword']:<12s} → 광고제외 {rank} / 전체 {rank_t}{ad}{delta_mark}"
         )
         summary_lines.append(
-            f"[{r['platform']}] {r['keyword']}: {rank}위{delta_mark}"
+            f"[{r['platform']}] {r['keyword']}: {rank}{delta_mark}"
         )
     logger.info("=" * 60)
 

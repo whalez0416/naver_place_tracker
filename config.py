@@ -107,10 +107,23 @@ USE_UNDETECTED_CHROMEDRIVER = False
 # 차단 상태를 STATE_FILE에 기록해 다음 실행에서도 쿨다운이 유지됩니다.
 NAVER_COOLDOWN_HOURS = 6
 
+# 구글이 이 횟수만큼 "연속으로" 차단되면 이번 실행의 남은 구글 조회를 중단합니다.
+# (계속 두드릴수록 rate limit이 길어지므로 네이버처럼 즉시 손을 뗍니다.)
+GOOGLE_BLOCK_STREAK_LIMIT = 3
+
+# 위 조건으로 구글 조회를 중단하면 이 시간(시간 단위)만큼 쿨다운을 겁니다.
+# 구글 제한은 보통 네이버 IP 차단보다 빨리 풀리므로 더 짧게 둡니다.
+GOOGLE_COOLDOWN_HOURS = 3
+
+# 반복 차단 시 쿨다운을 점진적으로 늘립니다. 실제 쿨다운 = 기본시간 × min(2^(연속차단-1), 이 값)
+# (예: 기본 6시간, 2회째 12시간, 3회째 24시간… 최대 6×4=24시간)
+COOLDOWN_ESCALATION_MAX = 4
+
 # 차단/쿨다운 상태를 저장하는 파일
 STATE_FILE = "state.json"
 
 # 일시적 오류(타임아웃/네트워크) 시 재시도 횟수와 재시도 전 대기(초) 범위
+# 구글 재시도는 시도할수록 대기를 2배씩 늘립니다(지수 백오프).
 MAX_RETRIES = 2
 RETRY_BACKOFF = (6, 14)
 

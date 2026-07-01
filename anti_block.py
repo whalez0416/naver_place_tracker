@@ -21,7 +21,7 @@ from config import (
     HEADLESS_MODE,
     PAGE_LOAD_TIMEOUT,
     USE_UNDETECTED_CHROMEDRIVER,
-    NAVER_COOLDOWN_HOURS,
+    COOLDOWN_ESCALATION_MAX,
     STATE_FILE,
 )
 
@@ -133,10 +133,10 @@ def _save_state(state: dict) -> None:
         logger.warning(f"상태 파일 저장 실패: {e}")
 
 
-def naver_cooldown_remaining() -> timedelta | None:
-    """네이버 쿨다운이 남아있으면 남은 시간을, 아니면 None을 반환합니다."""
+def cooldown_remaining(platform: str) -> timedelta | None:
+    """플랫폼('naver'/'google') 쿨다운이 남아있으면 남은 시간을, 아니면 None을 반환합니다."""
     state = _load_state()
-    until_str = state.get("naver_blocked_until")
+    until_str = state.get(f"{platform}_blocked_until")
     if not until_str:
         return None
     try:
@@ -149,23 +149,38 @@ def naver_cooldown_remaining() -> timedelta | None:
     return None
 
 
-def set_naver_cooldown() -> datetime:
-    """네이버 차단을 기록하고 쿨다운 종료 시각을 저장합니다."""
-    until = datetime.now() + timedelta(hours=NAVER_COOLDOWN_HOURS)
+def set_cooldown(platform: str, base_hours: float) -> datetime:
+    """플랫폼 차단을 기록하고 쿨다운 종료 시각을 저장합니다.
+
+    반복 차단 시 쿨다운을 점진적으로 늘립니다.
+    실제 시간 = base_hours × min(2^(연속차단-1), COOLDOWN_ESCALATION_MAX)
+    정상 조회에 성공하면 clear_cooldown()이 연속차단 카운트를 리셋합니다.
+    """
     state = _load_state()
-    state["naver_blocked_until"] = until.isoformat(timespec="seconds")
+    count_key = f"{platform}_block_count"
+    count = int(state.get(count_key, 0)) + 1
+    multiplier = min(2 ** (count - 1), COOLDOWN_ESCALATION_MAX)
+    hours = base_hours * multiplier
+
+    until = datetime.now() + timedelta(hours=hours)
+    state[f"{platform}_blocked_until"] = until.isoformat(timespec="seconds")
+    state[count_key] = count
     state["last_block_detected"] = datetime.now().isoformat(timespec="seconds")
     _save_state(state)
+
+    escalated = " (반복 차단으로 연장)" if count > 1 else ""
     logger.warning(
-        f"네이버 쿨다운 설정됨 — {until.strftime('%Y-%m-%d %H:%M')}까지 "
-        f"({NAVER_COOLDOWN_HOURS}시간) 네이버 조회를 건너뜁니다."
+        f"{platform} 쿨다운 설정됨 — {until.strftime('%Y-%m-%d %H:%M')}까지 "
+        f"(약 {hours:.0f}시간, 연속 {count}회 차단){escalated} 조회를 건너뜁니다."
     )
     return until
 
 
-def clear_naver_cooldown() -> None:
-    """네이버 쿨다운을 해제합니다 (정상 조회 성공 시 호출)."""
+def clear_cooldown(platform: str) -> None:
+    """플랫폼 쿨다운과 연속차단 카운트를 해제합니다 (정상 조회 성공 시 호출)."""
     state = _load_state()
-    if state.pop("naver_blocked_until", None) is not None:
+    changed = state.pop(f"{platform}_blocked_until", None) is not None
+    changed = state.pop(f"{platform}_block_count", None) is not None or changed
+    if changed:
         _save_state(state)
-        logger.info("네이버 쿨다운 해제됨 (정상 조회 확인)")
+        logger.info(f"{platform} 쿨다운 해제됨 (정상 조회 확인)")
